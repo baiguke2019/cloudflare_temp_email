@@ -2,7 +2,6 @@ import { Context } from 'hono';
 import { Jwt } from 'hono/utils/jwt'
 
 import i18n from '../i18n';
-import { HonoCustomType } from '../types';
 import { getJsonSetting } from '../utils';
 import { UserOauth2Settings } from '../models';
 import { CONSTANTS } from '../constants';
@@ -38,6 +37,7 @@ export default {
             client_id: setting.clientID,
             client_secret: setting.clientSecret,
             grant_type: 'authorization_code',
+            redirect_uri: setting.redirectURL,
         }
         const res = await fetch(setting.accessTokenURL, {
             method: 'POST',
@@ -57,19 +57,34 @@ export default {
         }
         const resJson = await res.json();
         const { access_token, token_type } = resJson as { access_token: string, token_type?: string };
-        const user = await fetch(setting.userInfoURL, {
+        const userRes = await fetch(setting.userInfoURL, {
             headers: {
                 "Authorization": `${token_type || 'Bearer'} ${access_token}`,
                 "Accept": "application/json",
                 "User-Agent": "Cloudflare Workers"
             }
         })
-        if (!user.ok) {
-            console.error(`Failed to get user info: ${res.status} ${res.statusText} ${await res.text()}`)
+        if (!userRes.ok) {
+            console.error(`Failed to get user info: ${userRes.status} ${userRes.statusText} ${await userRes.text()}`)
             return c.text(msgs.Oauth2FailedGetUserInfoMsg, 400);
         }
-        const userInfo = await user.json()
-        const { [setting.userEmailKey]: email } = userInfo as { [key: string]: string };
+        const userInfo = await userRes.json<any>()
+
+        const email = await (async () => {
+            if (setting.userEmailKey.startsWith("$")) {
+                const { JSONPath } = await import('jsonpath-plus');
+                const email = JSONPath({
+                    path: setting.userEmailKey,
+                    json: userInfo,
+                })
+                if (email && Array.isArray(email) && email.length > 0) {
+                    return email[0];
+                }
+            }
+            const { [setting.userEmailKey]: email } = userInfo as { [key: string]: string };
+            return email;
+        })()
+
         if (!email) {
             return c.text(msgs.Oauth2FailedGetUserEmailMsg, 400);
         }
@@ -100,7 +115,7 @@ export default {
             user_email: email,
             user_id: user_id,
             // 90 days expire in seconds
-            exp: Math.floor(Date.now() / 1000) + 90 * 24 * 60 * 60,
+            exp: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
             iat: Math.floor(Date.now() / 1000),
         }, c.env.JWT_SECRET, "HS256")
         return c.json({
