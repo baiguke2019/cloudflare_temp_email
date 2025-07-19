@@ -2,8 +2,7 @@ import { Context } from 'hono';
 import { Jwt } from 'hono/utils/jwt'
 
 import i18n from '../i18n';
-import { HonoCustomType } from '../types';
-import { getJsonSetting } from '../utils';
+import { getJsonSetting, getStringValue, getUserRoles } from '../utils';
 import { UserOauth2Settings } from '../models';
 import { CONSTANTS } from '../constants';
 
@@ -38,6 +37,7 @@ export default {
             client_id: setting.clientID,
             client_secret: setting.clientSecret,
             grant_type: 'authorization_code',
+            redirect_uri: setting.redirectURL,
         }
         const res = await fetch(setting.accessTokenURL, {
             method: 'POST',
@@ -57,19 +57,34 @@ export default {
         }
         const resJson = await res.json();
         const { access_token, token_type } = resJson as { access_token: string, token_type?: string };
-        const user = await fetch(setting.userInfoURL, {
+        const userRes = await fetch(setting.userInfoURL, {
             headers: {
                 "Authorization": `${token_type || 'Bearer'} ${access_token}`,
                 "Accept": "application/json",
                 "User-Agent": "Cloudflare Workers"
             }
         })
-        if (!user.ok) {
-            console.error(`Failed to get user info: ${res.status} ${res.statusText} ${await res.text()}`)
+        if (!userRes.ok) {
+            console.error(`Failed to get user info: ${userRes.status} ${userRes.statusText} ${await userRes.text()}`)
             return c.text(msgs.Oauth2FailedGetUserInfoMsg, 400);
         }
-        const userInfo = await user.json()
-        const { [setting.userEmailKey]: email } = userInfo as { [key: string]: string };
+        const userInfo = await userRes.json<any>()
+
+        const email = await (async () => {
+            if (setting.userEmailKey.startsWith("$")) {
+                const { JSONPath } = await import('jsonpath-plus');
+                const email = JSONPath({
+                    path: setting.userEmailKey,
+                    json: userInfo,
+                })
+                if (email && Array.isArray(email) && email.length > 0) {
+                    return email[0];
+                }
+            }
+            const { [setting.userEmailKey]: email } = userInfo as { [key: string]: string };
+            return email;
+        })()
+
         if (!email) {
             return c.text(msgs.Oauth2FailedGetUserEmailMsg, 400);
         }
@@ -95,12 +110,27 @@ export default {
         if (!user_id) {
             return c.text(msgs.UserNotFoundMsg, 400)
         }
+        const defaultRole = getStringValue(c.env.USER_DEFAULT_ROLE);
+        if (!defaultRole) return c.json({ success: true })
+        const user_roles = getUserRoles(c);
+        if (!user_roles.find((r) => r.role === defaultRole)) {
+            return c.text(msgs.InvalidUserDefaultRoleMsg, 500);
+        }
+        // update user roles
+        const { success: success2 } = await c.env.DB.prepare(
+            `INSERT INTO user_roles (user_id, role_text)`
+            + ` VALUES (?, ?)`
+            + ` ON CONFLICT(user_id) DO NOTHING`
+        ).bind(user_id, defaultRole).run();
+        if (!success2) {
+            return c.text(msgs.FailedUpdateUserDefaultRoleMsg, 500);
+        }
         // create jwt
         const jwt = await Jwt.sign({
             user_email: email,
             user_id: user_id,
             // 90 days expire in seconds
-            exp: Math.floor(Date.now() / 1000) + 90 * 24 * 60 * 60,
+            exp: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
             iat: Math.floor(Date.now() / 1000),
         }, c.env.JWT_SECRET, "HS256")
         return c.json({
